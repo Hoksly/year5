@@ -5,20 +5,20 @@ from moore import MooreAutomaton
 from transformer import Transformer
 from minimizator import Minimizator
 
-
+import os
 from argparse import ArgumentParser
 
 def mealy_to_moore_with_minimization(input_filename):
-    folder_path = "visualization/" + input_filename.split(".")[0] + "/"
+    file_name =  "minimizer_" + input_filename.split('/')[-1].split('.')[0]
+    folder_path = f"visualization/{file_name}/"
     os.makedirs(folder_path, exist_ok=True)
 
     minimizator = Minimizator()
 
     # 2. Зчитування автомата Мілі
     mealy_automaton = MealyAutomaton.from_file(input_filename)
+    mealy_automaton.visualize(folder_path + "mealy_input")
     
-    # Візуалізація автомата Мілі
-    #mealy_automaton.visualize("visualization/mealy_input")
     mealy_automaton.print_machine()
     # 3. Конвертація Mealy -> Moore
     moore_automaton = Transformer.mealy_to_moore(mealy_automaton)
@@ -55,13 +55,15 @@ def moore_to_mealy_with_minimization(input_filename):
     print("="*60)
     print("ПЕРЕТВОРЕННЯ MOORE -> MEALY")
     print("="*60)
+    file_name =  "minimizer_" + input_filename.split('/')[-1].split('.')[0]
+    folder_path = f"visualization/{file_name}/"
     minimizator = Minimizator()
 
     # 2. Зчитування автомата Мура
     moore_automaton = MooreAutomaton.from_file(input_filename)
     
     # Візуалізація автомата Мура
-    moore_automaton.visualize("visualization/moore_input")
+    moore_automaton.visualize(f"{folder_path}moore_input")
     
     # 3. Конвертація Moore -> Mealy
     mealy_automaton = Transformer.moore_to_mealy(moore_automaton)
@@ -72,8 +74,8 @@ def moore_to_mealy_with_minimization(input_filename):
     
     
     # Візуалізація автомата Мілі
-    mealy_automaton.visualize("visualization/mealy_output")
-    minimized_mealy.visualize("visualization/minimized_mealy_output")
+    mealy_automaton.visualize(f"{folder_path}mealy_output")
+    minimized_mealy.visualize(f"{folder_path}minimized_mealy_output")
     
     print("\n" + "="*60)
     print("ПЕРЕТВОРЕННЯ MEALY -> MOORE (зворотне)")
@@ -83,9 +85,9 @@ def moore_to_mealy_with_minimization(input_filename):
     moore_back = Transformer.mealy_to_moore(mealy_automaton)
     
     # Візуалізація зворотно перетвореного автомата Мура
-    moore_back.visualize("visualization/moore_back")
+    moore_back.visualize(f"{folder_path}moore_back")
     minimized_moore_back = minimizator.minimize_moore(moore_back)
-    minimized_moore_back.visualize("visualization/minimized_moore_back")
+    minimized_moore_back.visualize(f"{folder_path}minimized_moore_back")
 
 
 if __name__ == "__main__":
@@ -93,7 +95,6 @@ if __name__ == "__main__":
     arg_parser = ArgumentParser(description="Конвертер та мінімізатор автоматів Мілі та Мура")
     arg_parser.add_argument("mode", choices=["mealy", "moore"], help="Режим роботи: 'mealy' для Mealy->Moore, 'moore' для Moore->Mealy")    
     arg_parser.add_argument("input_file", help="Вхідний файл з описом автомата")
-
     args = arg_parser.parse_args()
     if args.mode == "mealy":
         mealy_to_moore_with_minimization(args.input_file)

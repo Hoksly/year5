@@ -1,3 +1,4 @@
+import collections
 from mealy import MealyAutomaton
 from moore import MooreAutomaton
 
