@@ -1,355 +1,890 @@
 #include <mpi.h>
 #include <bits/stdc++.h>
+
 using namespace std;
 
-struct COO { int r, c; double v; };
+// ============================================================================
+// Data Structures
+// ============================================================================
 
-struct CSR {
-    int nrows = 0;
-    int ncols = 0;
-    vector<int> row_ptr; // size nrows+1
-    vector<int> col_idx; // size nnz
-    vector<double> vals; // size nnz
+/**
+ * @brief Coordinate format entry for sparse matrices
+ */
+struct CoordinateEntry {
+    int row;
+    int column;
+    double value;
 };
 
-// Read Matrix Market coordinate (supports 'pattern' or 'real' and 'symmetric' or 'general')
-bool read_matrix_market(const string &path, int &nrows, int &ncols, vector<COO> &coo) {
-    ifstream in(path);
-    if(!in) return false;
-    string line;
-    // header
-    if(!getline(in, line)) return false;
-    if(line.size() < 2 || line[0] != '%') {
-        // still could be fine; MatrixMarket often starts with %%MatrixMarket
+/**
+ * @brief Compressed Sparse Row (CSR) format for efficient sparse matrix storage
+ */
+struct CompressedSparseRowMatrix {
+    int numberOfRows;
+    int numberOfColumns;
+    vector<int> rowPointers;    // Size: numberOfRows + 1
+    vector<int> columnIndices;  // Size: numberOfNonZeros
+    vector<double> values;      // Size: numberOfNonZeros
+
+    CompressedSparseRowMatrix()
+        : numberOfRows(0), numberOfColumns(0) {}
+
+    int getNumberOfNonZeros() const {
+        return static_cast<int>(values.size());
     }
-    bool coordinate = false;
-    bool pattern = false;
-    bool real = false;
-    bool symmetric = false;
-    // parse header tokens
-    {
-        string header = line;
-        // If first token is '%%MatrixMarket' parse the rest
-        stringstream ss(header);
+};
+
+// ============================================================================
+// Matrix Market File Reader
+// ============================================================================
+
+/**
+ * @brief Reads Matrix Market format files and converts to COO format
+ */
+class MatrixMarketReader {
+public:
+    /**
+     * @brief Read a Matrix Market file into coordinate format
+     * @param filePath Path to the .mtx file
+     * @param numberOfRows Output: number of rows
+     * @param numberOfColumns Output: number of columns
+     * @param coordinateEntries Output: vector of coordinate entries
+     * @return true if successful, false otherwise
+     */
+    static bool readMatrixMarketFile(
+        const string& filePath,
+        int& numberOfRows,
+        int& numberOfColumns,
+        vector<CoordinateEntry>& coordinateEntries
+    ) {
+        ifstream inputFile(filePath);
+        if (!inputFile) {
+            return false;
+        }
+
+        string currentLine;
+        bool isCoordinateFormat = false;
+        bool isPatternMatrix = false;
+        bool isRealMatrix = false;
+        bool isSymmetricMatrix = false;
+
+        // Parse header line
+        if (!getline(inputFile, currentLine)) {
+            return false;
+        }
+
+        parseHeaderLine(currentLine, isCoordinateFormat, isPatternMatrix,
+                       isRealMatrix, isSymmetricMatrix);
+
+        // Skip comment lines and read dimensions
+        while (getline(inputFile, currentLine)) {
+            if (currentLine.empty() || currentLine[0] == '%') {
+                continue;
+            }
+
+            // Parse dimensions line
+            stringstream dimensionStream(currentLine);
+            int matrixRows, matrixColumns, numberOfNonZeros;
+
+            if (!(dimensionStream >> matrixRows >> matrixColumns >> numberOfNonZeros)) {
+                continue;
+            }
+
+            numberOfRows = matrixRows;
+            numberOfColumns = matrixColumns;
+            coordinateEntries.clear();
+            coordinateEntries.reserve(max(0, numberOfNonZeros));
+
+            // Read entries
+            readCoordinateEntries(inputFile, numberOfNonZeros, isPatternMatrix,
+                                 isSymmetricMatrix, coordinateEntries);
+
+            return true;
+        }
+
+        return false;
+    }
+
+private:
+    /**
+     * @brief Parse the Matrix Market header line
+     */
+    static void parseHeaderLine(
+        const string& headerLine,
+        bool& isCoordinateFormat,
+        bool& isPatternMatrix,
+        bool& isRealMatrix,
+        bool& isSymmetricMatrix
+    ) {
+        stringstream headerStream(headerLine);
         string token;
-        ss >> token; // possibly %%MatrixMarket
-        if(token == "%%MatrixMarket") {
-            string type, format, field, symmetry;
-            if(!(ss >> type >> format >> field >> symmetry)) {
-                // header might extend to next tokens in next lines; we'll try to parse more from file if needed
-                // fallback: read rest of header from first non-comment lines
+        headerStream >> token;
+
+        if (token == "%%MatrixMarket") {
+            string objectType, formatType, fieldType, symmetryType;
+
+            if (headerStream >> objectType >> formatType >> fieldType >> symmetryType) {
+                isCoordinateFormat = (formatType == "coordinate");
+                isPatternMatrix = (fieldType == "pattern");
+                isRealMatrix = (fieldType == "real" || fieldType == "integer");
+                isSymmetricMatrix = (symmetryType == "symmetric" ||
+                                    symmetryType == "hermitian");
+            }
+        }
+    }
+
+    /**
+     * @brief Read coordinate entries from file
+     */
+    static void readCoordinateEntries(
+        ifstream& inputFile,
+        int numberOfNonZeros,
+        bool isPatternMatrix,
+        bool isSymmetricMatrix,
+        vector<CoordinateEntry>& coordinateEntries
+    ) {
+        string currentLine;
+
+        for (int entryIndex = 0; entryIndex < numberOfNonZeros; ) {
+            if (!getline(inputFile, currentLine)) {
+                break;
+            }
+
+            if (currentLine.empty() || currentLine[0] == '%') {
+                continue;
+            }
+
+            stringstream entryStream(currentLine);
+            int oneBasedRow, oneBasedColumn;
+            double entryValue = 1.0;
+
+            if (isPatternMatrix) {
+                if (!(entryStream >> oneBasedRow >> oneBasedColumn)) {
+                    continue;
+                }
+                entryValue = 1.0;
             } else {
-                coordinate = (format == "coordinate");
-                pattern = (field == "pattern");
-                real = (field == "real" || field == "integer");
-                if(symmetry == "symmetric" || symmetry == "hermitian") symmetric = true;
+                if (!(entryStream >> oneBasedRow >> oneBasedColumn >> entryValue)) {
+                    continue;
+                }
+            }
+
+            // Convert to zero-based indexing
+            int zeroBasedRow = oneBasedRow - 1;
+            int zeroBasedColumn = oneBasedColumn - 1;
+
+            if (zeroBasedRow < 0 || zeroBasedColumn < 0) {
+                continue;
+            }
+
+            coordinateEntries.push_back({zeroBasedRow, zeroBasedColumn, entryValue});
+
+            // Add symmetric entry if needed
+            if (isSymmetricMatrix && zeroBasedRow != zeroBasedColumn) {
+                coordinateEntries.push_back({zeroBasedColumn, zeroBasedRow, entryValue});
+            }
+
+            ++entryIndex;
+        }
+    }
+};
+
+// ============================================================================
+// Sparse Matrix Format Converter
+// ============================================================================
+
+/**
+ * @brief Converts between sparse matrix formats
+ */
+class SparseMatrixConverter {
+public:
+    /**
+     * @brief Convert COO format to CSR format, combining duplicate entries
+     */
+    static CompressedSparseRowMatrix convertCOOtoCSR(
+        int numberOfRows,
+        int numberOfColumns,
+        vector<CoordinateEntry>& coordinateEntries
+    ) {
+        CompressedSparseRowMatrix csrMatrix;
+        csrMatrix.numberOfRows = numberOfRows;
+        csrMatrix.numberOfColumns = numberOfColumns;
+
+        if (coordinateEntries.empty()) {
+            csrMatrix.rowPointers.assign(numberOfRows + 1, 0);
+            return csrMatrix;
+        }
+
+        // Sort entries by row, then by column
+        sort(coordinateEntries.begin(), coordinateEntries.end(),
+             [](const CoordinateEntry& a, const CoordinateEntry& b) {
+                 if (a.row != b.row) return a.row < b.row;
+                 return a.column < b.column;
+             });
+
+        // Combine duplicates and build CSR structure
+        vector<int> rowPointers(numberOfRows + 1, 0);
+        vector<int> columnIndices;
+        vector<double> values;
+
+        size_t entryIndex = 0;
+        while (entryIndex < coordinateEntries.size()) {
+            int currentRow = coordinateEntries[entryIndex].row;
+
+            // Process all entries in current row
+            while (entryIndex < coordinateEntries.size() &&
+                   coordinateEntries[entryIndex].row == currentRow) {
+                int currentColumn = coordinateEntries[entryIndex].column;
+                double accumulatedValue = coordinateEntries[entryIndex].value;
+                ++entryIndex;
+
+                // Accumulate duplicate entries
+                while (entryIndex < coordinateEntries.size() &&
+                       coordinateEntries[entryIndex].row == currentRow &&
+                       coordinateEntries[entryIndex].column == currentColumn) {
+                    accumulatedValue += coordinateEntries[entryIndex].value;
+                    ++entryIndex;
+                }
+
+                columnIndices.push_back(currentColumn);
+                values.push_back(accumulatedValue);
+                rowPointers[currentRow + 1]++;
+            }
+        }
+
+        // Convert row counts to cumulative pointers
+        for (int rowIndex = 1; rowIndex <= numberOfRows; ++rowIndex) {
+            rowPointers[rowIndex] += rowPointers[rowIndex - 1];
+        }
+
+        csrMatrix.rowPointers.swap(rowPointers);
+        csrMatrix.columnIndices.swap(columnIndices);
+        csrMatrix.values.swap(values);
+
+        return csrMatrix;
+    }
+
+    /**
+     * @brief Convert COO to CSR for a specific row range (for distributed matrices)
+     */
+    static CompressedSparseRowMatrix convertCOOtoCSRLocal(
+        int globalNumberOfRows,
+        int globalNumberOfColumns,
+        vector<CoordinateEntry>& localCoordinateEntries,
+        int localRowStart,
+        int localRowEnd
+    ) {
+        int localNumberOfRows = localRowEnd - localRowStart;
+        CompressedSparseRowMatrix csrMatrix;
+        csrMatrix.numberOfRows = localNumberOfRows;
+        csrMatrix.numberOfColumns = globalNumberOfColumns;
+
+        if (localCoordinateEntries.empty()) {
+            csrMatrix.rowPointers.assign(localNumberOfRows + 1, 0);
+            return csrMatrix;
+        }
+
+        // Sort entries
+        sort(localCoordinateEntries.begin(), localCoordinateEntries.end(),
+             [](const CoordinateEntry& a, const CoordinateEntry& b) {
+                 if (a.row != b.row) return a.row < b.row;
+                 return a.column < b.column;
+             });
+
+        vector<int> rowPointers(localNumberOfRows + 1, 0);
+        vector<int> columnIndices;
+        vector<double> values;
+
+        size_t entryIndex = 0;
+        while (entryIndex < localCoordinateEntries.size()) {
+            int localRow = localCoordinateEntries[entryIndex].row - localRowStart;
+
+            if (localRow < 0 || localRow >= localNumberOfRows) {
+                ++entryIndex;
+                continue;
+            }
+
+            while (entryIndex < localCoordinateEntries.size() &&
+                   (localCoordinateEntries[entryIndex].row - localRowStart) == localRow) {
+                int currentColumn = localCoordinateEntries[entryIndex].column;
+                double accumulatedValue = localCoordinateEntries[entryIndex].value;
+                ++entryIndex;
+
+                while (entryIndex < localCoordinateEntries.size() &&
+                       (localCoordinateEntries[entryIndex].row - localRowStart) == localRow &&
+                       localCoordinateEntries[entryIndex].column == currentColumn) {
+                    accumulatedValue += localCoordinateEntries[entryIndex].value;
+                    ++entryIndex;
+                }
+
+                columnIndices.push_back(currentColumn);
+                values.push_back(accumulatedValue);
+                rowPointers[localRow + 1]++;
+            }
+        }
+
+        for (int rowIndex = 1; rowIndex <= localNumberOfRows; ++rowIndex) {
+            rowPointers[rowIndex] += rowPointers[rowIndex - 1];
+        }
+
+        csrMatrix.rowPointers.swap(rowPointers);
+        csrMatrix.columnIndices.swap(columnIndices);
+        csrMatrix.values.swap(values);
+
+        return csrMatrix;
+    }
+};
+
+// ============================================================================
+// Sparse Matrix-Vector Multiplication Engine
+// ============================================================================
+
+/**
+ * @brief Handles sparse matrix-vector multiplication with MPI distribution
+ */
+class DistributedSparseMatrixVectorMultiplier {
+private:
+    int mpiRank;
+    int mpiSize;
+    MPI_Comm mpiCommunicator;
+
+public:
+    DistributedSparseMatrixVectorMultiplier(MPI_Comm communicator = MPI_COMM_WORLD)
+        : mpiCommunicator(communicator) {
+        MPI_Comm_rank(mpiCommunicator, &mpiRank);
+        MPI_Comm_size(mpiCommunicator, &mpiSize);
+    }
+
+    /**
+     * @brief Perform distributed sparse matrix-vector multiplication: y = A * x
+     * @param localMatrix Local portion of matrix A in CSR format
+     * @param globalVector Vector x (must be complete on all processes)
+     * @return Local portion of result vector y
+     */
+    vector<double> multiply(
+        const CompressedSparseRowMatrix& localMatrix,
+        const vector<double>& globalVector
+    ) const {
+        int localNumberOfRows = localMatrix.numberOfRows;
+        vector<double> localResult(localNumberOfRows, 0.0);
+
+        // Compute local matrix-vector product
+        for (int localRowIndex = 0; localRowIndex < localNumberOfRows; ++localRowIndex) {
+            double rowDotProduct = 0.0;
+
+            int rowStart = localMatrix.rowPointers[localRowIndex];
+            int rowEnd = localMatrix.rowPointers[localRowIndex + 1];
+
+            for (int entryIndex = rowStart; entryIndex < rowEnd; ++entryIndex) {
+                int columnIndex = localMatrix.columnIndices[entryIndex];
+                double matrixValue = localMatrix.values[entryIndex];
+
+                if (columnIndex >= 0 &&
+                    columnIndex < static_cast<int>(globalVector.size())) {
+                    rowDotProduct += matrixValue * globalVector[columnIndex];
+                }
+            }
+
+            localResult[localRowIndex] = rowDotProduct;
+        }
+
+        return localResult;
+    }
+
+    /**
+     * @brief Calculate row distribution across MPI processes
+     */
+    vector<int> calculateRowDistribution(int totalNumberOfRows) const {
+        vector<int> rowStartIndices(mpiSize + 1, 0);
+
+        int baseRowsPerProcess = totalNumberOfRows / mpiSize;
+        int remainingRows = totalNumberOfRows % mpiSize;
+
+        for (int processRank = 0; processRank < mpiSize; ++processRank) {
+            rowStartIndices[processRank] =
+                processRank * baseRowsPerProcess + min(processRank, remainingRows);
+        }
+        rowStartIndices[mpiSize] = totalNumberOfRows;
+
+        return rowStartIndices;
+    }
+
+    /**
+     * @brief Distribute matrix rows to appropriate processes
+     */
+    vector<CoordinateEntry> distributeMatrixRows(
+        const vector<CoordinateEntry>& allEntries,
+        const vector<int>& rowDistribution,
+        int localRowStart,
+        int localRowEnd
+    ) {
+        vector<CoordinateEntry> localEntries;
+
+        if (mpiRank == 0) {
+            // Root process distributes matrix entries
+            vector<vector<CoordinateEntry>> entriesPerProcess(mpiSize);
+
+            for (const auto& entry : allEntries) {
+                int ownerProcess = findOwnerProcess(entry.row, rowDistribution);
+                entriesPerProcess[ownerProcess].push_back(entry);
+            }
+
+            // Keep local entries
+            localEntries.swap(entriesPerProcess[0]);
+
+            // Send to other processes
+            for (int destinationRank = 1; destinationRank < mpiSize; ++destinationRank) {
+                sendCoordinateEntries(entriesPerProcess[destinationRank], destinationRank);
             }
         } else {
-            // Not standard header — try to detect later
+            // Non-root processes receive their entries
+            localEntries = receiveCoordinateEntries();
+        }
+
+        return localEntries;
+    }
+
+    /**
+     * @brief Gather local results to root process
+     */
+    vector<double> gatherResults(const vector<double>& localResult) const {
+        int localSize = static_cast<int>(localResult.size());
+        vector<int> allSizes(mpiSize);
+
+        MPI_Gather(&localSize, 1, MPI_INT,
+                   allSizes.data(), 1, MPI_INT,
+                   0, mpiCommunicator);
+
+        vector<int> displacements(mpiSize, 0);
+        int totalSize = 0;
+
+        if (mpiRank == 0) {
+            for (int processRank = 0; processRank < mpiSize; ++processRank) {
+                displacements[processRank] = totalSize;
+                totalSize += allSizes[processRank];
+            }
+        }
+
+        vector<double> globalResult(totalSize);
+
+        MPI_Gatherv(localResult.data(), localSize, MPI_DOUBLE,
+                    globalResult.data(), allSizes.data(),
+                    displacements.data(), MPI_DOUBLE,
+                    0, mpiCommunicator);
+
+        return globalResult;
+    }
+
+private:
+    /**
+     * @brief Find which process owns a given row
+     */
+    int findOwnerProcess(int rowIndex, const vector<int>& rowDistribution) const {
+        int ownerRank = static_cast<int>(
+            upper_bound(rowDistribution.begin(), rowDistribution.end(), rowIndex) -
+            rowDistribution.begin() - 1
+        );
+
+        return max(0, min(ownerRank, mpiSize - 1));
+    }
+
+    /**
+     * @brief Send coordinate entries to another process
+     */
+    void sendCoordinateEntries(
+        const vector<CoordinateEntry>& entries,
+        int destinationRank
+    ) const {
+        int entryCount = static_cast<int>(entries.size());
+        MPI_Send(&entryCount, 1, MPI_INT, destinationRank, 0, mpiCommunicator);
+
+        if (entryCount > 0) {
+            vector<int> rows(entryCount), columns(entryCount);
+            vector<double> values(entryCount);
+
+            for (int i = 0; i < entryCount; ++i) {
+                rows[i] = entries[i].row;
+                columns[i] = entries[i].column;
+                values[i] = entries[i].value;
+            }
+
+            MPI_Send(rows.data(), entryCount, MPI_INT,
+                    destinationRank, 1, mpiCommunicator);
+            MPI_Send(columns.data(), entryCount, MPI_INT,
+                    destinationRank, 2, mpiCommunicator);
+            MPI_Send(values.data(), entryCount, MPI_DOUBLE,
+                    destinationRank, 3, mpiCommunicator);
         }
     }
-    // skip comments
-    while(getline(in, line)){
-        if(line.size() == 0) continue;
-        if(line[0] == '%') continue;
-        // this line should contain dimensions
-        stringstream ss(line);
-        int m,n,nnz;
-        if(!(ss >> m >> n >> nnz)) {
-            continue; // skip weird lines
-        }
-        nrows = m; ncols = n;
-        coo.clear(); coo.reserve(max(0, nnz));
-        // now read nnz entries
-        for(int k=0;k<nnz;){
-            if(!getline(in, line)) break;
-            if(line.size() == 0) continue;
-            if(line[0] == '%') continue;
-            stringstream es(line);
-            int i,j; double val = 1.0;
-            if(pattern) {
-                if(!(es >> i >> j)) continue;
-                val = 1.0;
-            } else {
-                if(!(es >> i >> j >> val)) continue;
+
+    /**
+     * @brief Receive coordinate entries from root process
+     */
+    vector<CoordinateEntry> receiveCoordinateEntries() const {
+        int entryCount = 0;
+        MPI_Recv(&entryCount, 1, MPI_INT, 0, 0,
+                mpiCommunicator, MPI_STATUS_IGNORE);
+
+        vector<CoordinateEntry> entries;
+
+        if (entryCount > 0) {
+            vector<int> rows(entryCount), columns(entryCount);
+            vector<double> values(entryCount);
+
+            MPI_Recv(rows.data(), entryCount, MPI_INT, 0, 1,
+                    mpiCommunicator, MPI_STATUS_IGNORE);
+            MPI_Recv(columns.data(), entryCount, MPI_INT, 0, 2,
+                    mpiCommunicator, MPI_STATUS_IGNORE);
+            MPI_Recv(values.data(), entryCount, MPI_DOUBLE, 0, 3,
+                    mpiCommunicator, MPI_STATUS_IGNORE);
+
+            entries.resize(entryCount);
+            for (int i = 0; i < entryCount; ++i) {
+                entries[i] = {rows[i], columns[i], values[i]};
             }
-            // convert to 0-based
-            int r = i-1;
-            int c = j-1;
-            if(r < 0 || c < 0) continue;
-            coo.push_back({r,c,val});
-            if(symmetric && r != c) {
-                coo.push_back({c,r,val});
-            }
-            // we advanced to 1 or 2 actual entries depending on symmetric; count only original nnz
-            ++k;
         }
+
+        return entries;
+    }
+};
+
+// ============================================================================
+// Matrix Market Writer
+// ============================================================================
+
+/**
+ * @brief Writes results in Matrix Market format
+ */
+class MatrixMarketWriter {
+public:
+    /**
+     * @brief Write a dense vector to Matrix Market coordinate format
+     */
+    static bool writeVector(
+        const string& outputPath,
+        const vector<double>& vectorData,
+        double zeroTolerance = 1e-12
+    ) {
+        // Collect non-zero entries
+        vector<pair<int, double>> nonZeroEntries;
+        nonZeroEntries.reserve(vectorData.size());
+
+        for (size_t i = 0; i < vectorData.size(); ++i) {
+            if (fabs(vectorData[i]) > zeroTolerance) {
+                nonZeroEntries.push_back({static_cast<int>(i), vectorData[i]});
+            }
+        }
+
+        // Write to file
+        ofstream outputFile(outputPath);
+        if (!outputFile) {
+            return false;
+        }
+
+        outputFile << "%%MatrixMarket matrix coordinate real general\n";
+        outputFile << vectorData.size() << " " << 1 << " "
+                  << nonZeroEntries.size() << "\n";
+        outputFile << setprecision(12);
+
+        for (const auto& entry : nonZeroEntries) {
+            outputFile << (entry.first + 1) << " " << 1 << " "
+                      << entry.second << "\n";
+        }
+
+        outputFile.close();
         return true;
     }
-    return false;
-}
+};
 
-// Convert COO to CSR (sums duplicates)
-CSR coo_to_csr(int nrows, int ncols, vector<COO> &coo) {
-    CSR A;
-    A.nrows = nrows; A.ncols = ncols;
-    if(coo.empty()) {
-        A.row_ptr.assign(nrows+1, 0);
-        return A;
-    }
-    // sort by (r,c)
-    sort(coo.begin(), coo.end(), [](const COO &a, const COO &b){ if(a.r!=b.r) return a.r < b.r; return a.c < b.c; });
-    // combine duplicates
-    vector<int> row_ptr(nrows+1, 0);
-    vector<int> cols;
-    vector<double> vals;
-    int idx = 0;
-    while(idx < (int)coo.size()){
-        int r = coo[idx].r;
-        // process this row
-        while(idx < (int)coo.size() && coo[idx].r == r) {
-            int c = coo[idx].c;
-            double s = coo[idx].v;
-            ++idx;
-            while(idx < (int)coo.size() && coo[idx].r == r && coo[idx].c == c) {
-                s += coo[idx].v; ++idx;
+// ============================================================================
+// Main Application
+// ============================================================================
+
+/**
+ * @brief Main application orchestrating the distributed SpMV operation
+ */
+class DistributedSpMVApplication {
+private:
+    int mpiRank;
+    int mpiSize;
+    string matrixFilePath;
+    string vectorFilePath;
+    string outputFilePath;
+    double zeroTolerance;
+
+public:
+    DistributedSpMVApplication(int argc, char** argv) {
+        MPI_Init(&argc, &argv);
+        MPI_Comm_rank(MPI_COMM_WORLD, &mpiRank);
+        MPI_Comm_size(MPI_COMM_WORLD, &mpiSize);
+
+        if (!parseCommandLineArguments(argc, argv)) {
+            if (mpiRank == 0) {
+                printUsage(argv[0]);
             }
-            cols.push_back(c);
-            vals.push_back(s);
-            row_ptr[r+1]++;
+            MPI_Finalize();
+            exit(1);
         }
     }
-    // convert row counts to pointers
-    for(int i=1;i<=nrows;++i) row_ptr[i] += row_ptr[i-1];
-    A.row_ptr.swap(row_ptr);
-    A.col_idx.swap(cols);
-    A.vals.swap(vals);
-    return A;
-}
 
-// Convert vector<COO> to CSR but only include rows in [rstart, rend) and shift rows to local indexing
-CSR coo_to_csr_local(int nrows_global, int ncols_global, vector<COO> &coo_local, int rstart, int rend) {
-    int local_nrows = rend - rstart;
-    CSR A;
-    A.nrows = local_nrows; A.ncols = ncols_global;
-    if(coo_local.empty()){
-        A.row_ptr.assign(local_nrows+1, 0);
-        return A;
-    }
-    // sort
-    sort(coo_local.begin(), coo_local.end(), [](const COO &a, const COO &b){ if(a.r!=b.r) return a.r < b.r; return a.c < b.c; });
-    vector<int> row_ptr(local_nrows+1, 0);
-    vector<int> cols;
-    vector<double> vals;
-    int idx = 0;
-    while(idx < (int)coo_local.size()){
-        int r = coo_local[idx].r - rstart; // local row index
-        if(r < 0 || r >= local_nrows) { ++idx; continue; }
-        while(idx < (int)coo_local.size() && (coo_local[idx].r - rstart) == r) {
-            int c = coo_local[idx].c;
-            double s = coo_local[idx].v;
-            ++idx;
-            while(idx < (int)coo_local.size() && (coo_local[idx].r - rstart) == r && coo_local[idx].c == c) {
-                s += coo_local[idx].v; ++idx;
-            }
-            cols.push_back(c);
-            vals.push_back(s);
-            row_ptr[r+1]++;
-        }
-    }
-    for(int i=1;i<=local_nrows;++i) row_ptr[i] += row_ptr[i-1];
-    A.row_ptr.swap(row_ptr);
-    A.col_idx.swap(cols);
-    A.vals.swap(vals);
-    return A;
-}
-
-int main(int argc, char **argv) {
-    MPI_Init(&argc, &argv);
-    int rank, size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
-
-    if(argc < 4) {
-        if(rank == 0) {
-            cerr << "Usage: " << argv[0] << " A.mtx x.mtx out.mtx [tol]" << endl;
-        }
+    ~DistributedSpMVApplication() {
         MPI_Finalize();
+    }
+
+    /**
+     * @brief Execute the distributed sparse matrix-vector multiplication
+     */
+    int run() {
+        // Step 1: Read and validate inputs on root
+        int matrixRows = 0, matrixColumns = 0;
+        int vectorRows = 0, vectorColumns = 0;
+        vector<CoordinateEntry> matrixEntries, vectorEntries;
+
+        if (!readAndValidateInputs(matrixRows, matrixColumns,
+                                   vectorRows, vectorColumns,
+                                   matrixEntries, vectorEntries)) {
+            return 1;
+        }
+
+        // Step 2: Broadcast dimensions
+        broadcastDimensions(matrixRows, matrixColumns, vectorRows, vectorColumns);
+
+        // Step 3: Distribute matrix across processes
+        DistributedSparseMatrixVectorMultiplier multiplier;
+        vector<int> rowDistribution = multiplier.calculateRowDistribution(matrixRows);
+
+        int localRowStart = rowDistribution[mpiRank];
+        int localRowEnd = rowDistribution[mpiRank + 1];
+
+        vector<CoordinateEntry> localMatrixEntries =
+            multiplier.distributeMatrixRows(matrixEntries, rowDistribution,
+                                           localRowStart, localRowEnd);
+
+        // Free memory on root
+        matrixEntries.clear();
+        matrixEntries.shrink_to_fit();
+
+        // Step 4: Convert to CSR format
+        CompressedSparseRowMatrix localMatrix =
+            SparseMatrixConverter::convertCOOtoCSRLocal(
+                matrixRows, matrixColumns, localMatrixEntries,
+                localRowStart, localRowEnd
+            );
+
+        localMatrixEntries.clear();
+        localMatrixEntries.shrink_to_fit();
+
+        // Step 5: Prepare and broadcast vector
+        vector<double> denseVector = prepareDenseVector(
+            vectorRows, vectorColumns, vectorEntries
+        );
+
+        vectorEntries.clear();
+        vectorEntries.shrink_to_fit();
+
+        // Step 6: Perform local multiplication
+        vector<double> localResult = multiplier.multiply(localMatrix, denseVector);
+
+        // Step 7: Gather results
+        vector<double> globalResult = multiplier.gatherResults(localResult);
+
+        // Step 8: Write output
+        if (mpiRank == 0) {
+            if (MatrixMarketWriter::writeVector(outputFilePath, globalResult,
+                                               zeroTolerance)) {
+                cerr << "Successfully wrote output: " << outputFilePath
+                     << " (nnz=" << countNonZeros(globalResult) << ")\n";
+            } else {
+                cerr << "Failed to write output file: " << outputFilePath << endl;
+                return 1;
+            }
+        }
+
+        return 0;
+    }
+
+private:
+    /**
+     * @brief Parse command line arguments
+     */
+    bool parseCommandLineArguments(int argc, char** argv) {
+        if (argc < 4) {
+            return false;
+        }
+
+        matrixFilePath = argv[1];
+        vectorFilePath = argv[2];
+        outputFilePath = argv[3];
+        zeroTolerance = (argc >= 5) ? atof(argv[4]) : 1e-12;
+
+        return true;
+    }
+
+    /**
+     * @brief Print usage information
+     */
+    void printUsage(const char* programName) const {
+        cerr << "Usage: " << programName
+             << " A.mtx x.mtx out.mtx [tolerance]\n";
+        cerr << "  A.mtx       : Input matrix file in Matrix Market format\n";
+        cerr << "  x.mtx       : Input vector file in Matrix Market format\n";
+        cerr << "  out.mtx     : Output file path\n";
+        cerr << "  tolerance   : Zero tolerance (default: 1e-12)\n";
+    }
+
+    /**
+     * @brief Read and validate input files on root process
+     */
+    bool readAndValidateInputs(
+        int& matrixRows, int& matrixColumns,
+        int& vectorRows, int& vectorColumns,
+        vector<CoordinateEntry>& matrixEntries,
+        vector<CoordinateEntry>& vectorEntries
+    ) {
+        int validationStatus = 1;
+
+        if (mpiRank == 0) {
+            if (!MatrixMarketReader::readMatrixMarketFile(
+                    matrixFilePath, matrixRows, matrixColumns, matrixEntries)) {
+                cerr << "Failed to read matrix file: " << matrixFilePath << endl;
+                validationStatus = 0;
+            }
+
+            if (validationStatus && !MatrixMarketReader::readMatrixMarketFile(
+                    vectorFilePath, vectorRows, vectorColumns, vectorEntries)) {
+                cerr << "Failed to read vector file: " << vectorFilePath << endl;
+                validationStatus = 0;
+            }
+
+            if (validationStatus) {
+                if (!validateVectorDimensions(vectorRows, vectorColumns, matrixColumns)) {
+                    validationStatus = 0;
+                }
+            }
+        }
+
+        MPI_Bcast(&validationStatus, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+        if (!validationStatus) {
+            if (mpiRank == 0) {
+                cerr << "Input validation failed. Exiting.\n";
+            }
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * @brief Validate vector dimensions against matrix
+     */
+    bool validateVectorDimensions(
+        int vectorRows, int vectorColumns, int matrixColumns
+    ) const {
+        int vectorLength = 0;
+        bool isColumnVector = false;
+
+        if (vectorColumns == 1) {
+            vectorLength = vectorRows;
+            isColumnVector = true;
+        } else if (vectorRows == 1) {
+            vectorLength = vectorColumns;
+            isColumnVector = false;
+        } else {
+            cerr << "Second input must be a vector (one row or one column). "
+                 << "Got dimensions: " << vectorRows << " x " << vectorColumns << "\n";
+            return false;
+        }
+
+        if (matrixColumns != vectorLength) {
+            cerr << "Dimension mismatch: matrix columns = " << matrixColumns
+                 << ", vector length = " << vectorLength << "\n";
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * @brief Broadcast matrix and vector dimensions to all processes
+     */
+    void broadcastDimensions(
+        int& matrixRows, int& matrixColumns,
+        int& vectorRows, int& vectorColumns
+    ) const {
+        MPI_Bcast(&matrixRows, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        MPI_Bcast(&matrixColumns, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        MPI_Bcast(&vectorRows, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        MPI_Bcast(&vectorColumns, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    }
+
+    /**
+     * @brief Convert sparse vector to dense format and broadcast
+     */
+    vector<double> prepareDenseVector(
+        int vectorRows, int vectorColumns,
+        vector<CoordinateEntry>& vectorEntries
+    ) const {
+        int vectorLength = 0;
+        vector<double> denseVector;
+
+        if (mpiRank == 0) {
+            vectorLength = (vectorColumns == 1) ? vectorRows : vectorColumns;
+            denseVector.assign(vectorLength, 0.0);
+
+            // Accumulate vector values (handle duplicates)
+            for (const auto& entry : vectorEntries) {
+                int index = (vectorColumns == 1) ? entry.row : entry.column;
+                if (index >= 0 && index < vectorLength) {
+                    denseVector[index] += entry.value;
+                }
+            }
+        }
+
+        // Broadcast vector length and data to all processes
+        MPI_Bcast(&vectorLength, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+        if (mpiRank != 0) {
+            denseVector.assign(vectorLength, 0.0);
+        }
+
+        if (vectorLength > 0) {
+            MPI_Bcast(denseVector.data(), vectorLength, MPI_DOUBLE,
+                     0, MPI_COMM_WORLD);
+        }
+
+        return denseVector;
+    }
+
+    /**
+     * @brief Count non-zero entries in result vector
+     */
+    int countNonZeros(const vector<double>& vectorData) const {
+        int count = 0;
+        for (double value : vectorData) {
+            if (fabs(value) > zeroTolerance) {
+                ++count;
+            }
+        }
+        return count;
+    }
+};
+
+// ============================================================================
+// Program Entry Point
+// ============================================================================
+
+int main(int argc, char** argv) {
+    try {
+        DistributedSpMVApplication application(argc, argv);
+        return application.run();
+    } catch (const exception& e) {
+        cerr << "Error: " << e.what() << endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+        return 1;
+    } catch (...) {
+        cerr << "Unknown error occurred" << endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
         return 1;
     }
-    string Apath = argv[1];
-    string XPath = argv[2];
-    string OutPath = argv[3];
-    double tol = 1e-12;
-    if(argc >= 5) tol = atof(argv[4]);
-
-    int A_nrows=0, A_ncols=0, x_nrows=0, x_ncols=0;
-    vector<COO> A_coo_all, x_coo_all;
-
-    // Rank 0 reads files and validates inputs; then broadcast an 'ok' flag to all ranks
-    int ok = 1; // 1 = inputs valid, 0 = invalid
-    if(rank == 0) {
-        if(!read_matrix_market(Apath, A_nrows, A_ncols, A_coo_all)) {
-            cerr << "Failed to read A file: " << Apath << endl;
-            ok = 0;
-        }
-        if(ok && !read_matrix_market(XPath, x_nrows, x_ncols, x_coo_all)) {
-            cerr << "Failed to read x file: " << XPath << endl;
-            ok = 0;
-        }
-        if(ok) {
-            // Determine vector length and orientation
-            int x_len = 0;
-            bool x_is_col = false;
-            if(x_ncols == 1) { x_len = x_nrows; x_is_col = true; }
-            else if(x_nrows == 1) { x_len = x_ncols; x_is_col = false; }
-            else {
-                cerr << "Second input must be a vector (one column or one row). Got dimensions: " << x_nrows << " x " << x_ncols << "\n";
-                ok = 0;
-            }
-            if(ok && A_ncols != x_len) {
-                cerr << "Inner dimensions mismatch: A.cols="<<A_ncols<<" x.len="<<x_len<<"\n";
-                ok = 0;
-            }
-        }
-    }
-
-    // Broadcast whether inputs are valid
-    MPI_Bcast(&ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    if(!ok) {
-        if(rank == 0) cerr << "Input validation failed. Exiting." << endl;
-        MPI_Finalize();
-        return 1;
-    }
-
-    // Broadcast matrix sizes (safe now because inputs validated and read on rank 0)
-    MPI_Bcast(&A_nrows, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(&A_ncols, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(&x_nrows, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(&x_ncols, 1, MPI_INT, 0, MPI_COMM_WORLD);
-
-    // Partition rows of A across ranks (contiguous blocks)
-    vector<int> row_starts(size+1,0);
-    int base = A_nrows / size;
-    int rem = A_nrows % size;
-    for(int r=0;r<size;++r){
-        row_starts[r] = r*base + min(r, rem);
-    }
-    row_starts[size] = A_nrows;
-    int rstart = row_starts[rank];
-    int rend = row_starts[rank+1];
-    int local_nrows = rend - rstart;
-
-    // Distribute A: send COO entries whose row in [rstart, rend) to each rank
-    vector<COO> A_coo_local;
-    if(rank == 0) {
-        // For each rank prepare a vector of entries
-        vector<vector<COO>> sendbuf(size);
-        for(const auto &e : A_coo_all){
-            int r = e.r;
-            int owner = upper_bound(row_starts.begin(), row_starts.end(), r) - row_starts.begin() - 1;
-            if(owner < 0) owner = 0;
-            if(owner >= size) owner = size-1;
-            sendbuf[owner].push_back(e);
-        }
-        // rank 0 keeps its portion
-        A_coo_local.swap(sendbuf[0]);
-        // send others
-        for(int dest=1; dest<size; ++dest){
-            int cnt = (int)sendbuf[dest].size();
-            MPI_Send(&cnt, 1, MPI_INT, dest, 0, MPI_COMM_WORLD);
-            if(cnt > 0){
-                // prepare arrays
-                vector<int> rows(cnt), cols(cnt);
-                vector<double> vals(cnt);
-                for(int i=0;i<cnt;++i){ rows[i] = sendbuf[dest][i].r; cols[i] = sendbuf[dest][i].c; vals[i] = sendbuf[dest][i].v; }
-                MPI_Send(rows.data(), cnt, MPI_INT, dest, 1, MPI_COMM_WORLD);
-                MPI_Send(cols.data(), cnt, MPI_INT, dest, 2, MPI_COMM_WORLD);
-                MPI_Send(vals.data(), cnt, MPI_DOUBLE, dest, 3, MPI_COMM_WORLD);
-            }
-        }
-    } else {
-        int cnt=0;
-        MPI_Recv(&cnt, 1, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        if(cnt > 0){
-            vector<int> rows(cnt), cols(cnt);
-            vector<double> vals(cnt);
-            MPI_Recv(rows.data(), cnt, MPI_INT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            MPI_Recv(cols.data(), cnt, MPI_INT, 0, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            MPI_Recv(vals.data(), cnt, MPI_DOUBLE, 0, 3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            A_coo_local.resize(cnt);
-            for(int i=0;i<cnt;++i){ A_coo_local[i] = {rows[i], cols[i], vals[i]}; }
-        }
-    }
-
-    // Convert local A COO to local CSR
-    CSR A_local = coo_to_csr_local(A_nrows, A_ncols, A_coo_local, rstart, rend);
-
-    // Prepare dense vector x on root and broadcast
-    int x_len = 0;
-    vector<double> x_dense;
-    if(rank == 0){
-        if(x_ncols == 1) x_len = x_nrows; else x_len = x_ncols; // validated earlier
-        x_dense.assign(x_len, 0.0);
-        // sum duplicates
-        for(const auto &e : x_coo_all){
-            int idx = (x_ncols == 1) ? e.r : e.c;
-            if(idx >=0 && idx < x_len) x_dense[idx] += e.v;
-        }
-    }
-    // broadcast vector length then values
-    MPI_Bcast(&x_len, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    if(rank != 0) x_dense.assign(x_len, 0.0);
-    if(x_len > 0) MPI_Bcast(x_dense.data(), x_len, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-
-    // Free large local buffers
-    A_coo_all.clear(); A_coo_all.shrink_to_fit(); x_coo_all.clear(); x_coo_all.shrink_to_fit(); A_coo_local.clear(); A_coo_local.shrink_to_fit();
-
-    // Local multiplication: for each local row, compute dot-product with x
-    vector<double> y_local(local_nrows, 0.0);
-    for(int lr=0; lr < A_local.nrows; ++lr){
-        double s = 0.0;
-        int a_start = A_local.row_ptr[lr];
-        int a_end = A_local.row_ptr[lr+1];
-        for(int ai = a_start; ai < a_end; ++ai){
-            int j = A_local.col_idx[ai];
-            double aij = A_local.vals[ai];
-            if(j >= 0 && j < x_len) s += aij * x_dense[j];
-        }
-        y_local[lr] = s;
-    }
-
-    // Gather local row counts to root
-    int local_rows = local_nrows;
-    vector<int> all_counts(size);
-    MPI_Gather(&local_rows, 1, MPI_INT, all_counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
-
-    vector<int> displs(size,0);
-    int total_rows = 0;
-    if(rank == 0){
-        for(int i=0;i<size;++i){ displs[i] = total_rows; total_rows += all_counts[i]; }
-    }
-
-    // Gather results to root
-    vector<double> y_all(total_rows);
-    MPI_Gatherv(y_local.data(), local_rows, MPI_DOUBLE, y_all.data(), all_counts.data(), displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
-
-    if(rank == 0){
-        // write output as n x 1 coordinate file with nonzeros only
-        vector<pair<int,double>> nz;
-        nz.reserve(total_rows);
-        for(int i=0;i<total_rows;++i){ if(fabs(y_all[i]) > tol) nz.push_back({i, y_all[i]}); }
-        ofstream out(OutPath);
-        if(!out){ cerr << "Failed to open output file: " << OutPath << endl; MPI_Abort(MPI_COMM_WORLD, 6); }
-        out << "%%MatrixMarket matrix coordinate real general\n";
-        out << "% Produced by spmv_mpi\n";
-        out << A_nrows << " " << 1 << " " << nz.size() << "\n";
-        out << setprecision(12);
-        for(auto &t : nz){ out << (t.first + 1) << " " << 1 << " " << t.second << "\n"; }
-        out.close();
-        cerr << "Wrote output: " << OutPath << " (nnz=" << nz.size() << ")\n";
-    }
-
-    MPI_Finalize();
-    return 0;
 }
