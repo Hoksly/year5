@@ -39,6 +39,6 @@ class MarketPage(BasePage):
             # Scroll down if not found
             print(f"DEBUG: {target_ticker} not found in scroll {i+1} ({len(rows)} rows checked). Scrolling...")
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(2) 
+            self.wait_for_visibility(MarketPageLocators.MARKET_ROW, time=5)
 
         return False
